@@ -46,12 +46,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from marginals import fit_marginals, pit_transform, fit_market, pit_transform_market
+from marginals import (
+    empirical_pit, empirical_pit_market,
+    fit_marginals, pit_transform, fit_market, pit_transform_market,
+)
 from vine_copula import fit_vine
 from crisis_event import build_crisis_spec
 from mcmc_sampler import run_sampler
 from mes_estimator import estimate_mes
-from data_loader import download_sector_data, DEFAULT_MARKET
+from data_loader import download_sector_data, download_rate_data, DEFAULT_MARKET
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +78,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="End date for download (default: today).")
     parser.add_argument("--force", action="store_true",
                         help="Re-download even if cache exists.")
+    # Crisis type
+    parser.add_argument("--crisis", type=str, default="market",
+                        choices=["market", "rates"],
+                        help="Crisis definition: 'market' (lower tail of market return, default) "
+                             "or 'rates' (upper tail of rate change = yield spike).")
+    parser.add_argument("--rate_ticker", type=str, default="^TNX",
+                        help="Yahoo Finance yield ticker for rate spike crisis (default: ^TNX).")
     # Synthetic data fallback
     parser.add_argument("--N", type=int, default=5,
                         help="Sectors for synthetic data (ignored with --real).")
     parser.add_argument("--T", type=int, default=600,
                         help="Time steps for synthetic data.")
     # Pipeline parameters
+    parser.add_argument("--marginals", type=str, default="empirical",
+                        choices=["empirical", "garch"],
+                        help="Marginal PIT method: 'empirical' (rank-based, default) "
+                             "or 'garch' (GARCH(1,1)-skewed-t).")
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="VaR level for crisis event (default 0.05).")
-    parser.add_argument("--sampler", type=str, default="gibbs",
-                        choices=["gibbs", "hmc"])
+    parser.add_argument("--sampler", type=str, default="rejection",
+                        choices=["rejection", "mwg", "gibbs", "hmc"])
     parser.add_argument("--N_samples", type=int, default=2000)
     parser.add_argument("--n_warmup", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
@@ -117,6 +131,19 @@ def _load_or_generate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.Series
             market_ticker=args.market,
             force_download=args.force,
         )
+        if args.crisis == "rates":
+            # Replace the market series with the rate change series,
+            # aligned to the same dates as the sector returns
+            rate_changes = download_rate_data(
+                ticker=args.rate_ticker,
+                start=args.start,
+                end=args.end,
+                force_download=args.force,
+            )
+            common = returns.index.intersection(rate_changes.index)
+            returns = returns.loc[common]
+            rate_changes = rate_changes.loc[common]
+            return returns, rate_changes
         return returns, market
 
     # Synthetic: N correlated sector series + 1 market series
@@ -161,18 +188,28 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
     T, N_sectors = returns.shape
     print(f"\n--- Pipeline: T={T}, N_sectors={N_sectors}, market='{market.name}' ---")
 
-    # Step 1: Fit marginals
-    print("[1/5] Fitting GARCH(1,1)-skewed-t marginals...")
-    sector_params = fit_marginals(returns)
-    market_params = fit_market(market)
-    U_sectors = pit_transform(returns, sector_params)     # (T, N_sectors)
-    u_market  = pit_transform_market(market, market_params)  # (T,)
+    # Step 1: PIT transform to uniform pseudo-observations
+    if args.marginals == "empirical":
+        print("[1/5] Applying empirical PIT (rank-based)...")
+        U_sectors = empirical_pit(returns)                    # (T, N_sectors)
+        u_market  = empirical_pit_market(market)              # (T,)
+    else:
+        print("[1/5] Fitting GARCH(1,1)-skewed-t marginals...")
+        sector_params = fit_marginals(returns)
+        market_params = fit_market(market)
+        U_sectors = pit_transform(returns, sector_params)     # (T, N_sectors)
+        u_market  = pit_transform_market(market, market_params)  # (T,)
 
     # Stack: sectors first, market last
     U_full = np.column_stack([U_sectors, u_market])       # (T, N_sectors + 1)
     print(f"      U_full shape: {U_full.shape}")
-    print(f"      Fraction of market u ≤ alpha={args.alpha}: "
-          f"{(u_market <= args.alpha).mean():.3f}  (expect ~{args.alpha})")
+    tail_preview = "upper" if args.crisis == "rates" else "lower"
+    if tail_preview == "lower":
+        print(f"      Fraction of crisis u ≤ {args.alpha}: "
+              f"{(u_market <= args.alpha).mean():.3f}  (expect ~{args.alpha})")
+    else:
+        print(f"      Fraction of crisis u ≥ {1-args.alpha:.2f}: "
+              f"{(u_market >= 1-args.alpha).mean():.3f}  (expect ~{args.alpha})")
 
     # Step 2: Fit R-vine on all N+1 variables
     N_total = N_sectors + 1
@@ -182,17 +219,22 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
     print(f"      Families (first 5): {vine_result.family_names[:5]}")
 
     # Step 3: Build crisis spec
-    print(f"[3/5] Building crisis event: u_{market.name} ≤ {args.alpha} ...")
+    tail = "upper" if args.crisis == "rates" else "lower"
+    direction = f"≥ {1-args.alpha:.2f}" if tail == "upper" else f"≤ {args.alpha:.2f}"
+    print(f"[3/5] Building crisis event: u_{market.name} {direction} (tail='{tail}')...")
     crisis_spec = build_crisis_spec(
         U_full, alpha=args.alpha,
-        market_idx=N_sectors,          # last column
-        market_name=market.name,
+        crisis_idx=N_sectors,          # last column
+        tail=tail,
+        crisis_name=market.name,
     )
     print(f"      {crisis_spec}")
 
-    # Step 4: MCMC sampling
-    print(f"[4/5] Running {args.sampler.upper()} sampler "
-          f"(N_samples={args.N_samples}, warmup={args.n_warmup})...")
+    # Step 4: Sampling
+    sampler_desc = (f"N_samples={args.N_samples}"
+                    if args.sampler == "rejection"
+                    else f"N_samples={args.N_samples}, warmup={args.n_warmup}")
+    print(f"[4/5] Running {args.sampler.upper()} sampler ({sampler_desc})...")
     samples_U = run_sampler(
         vine_result=vine_result,
         crisis_spec=crisis_spec,
@@ -202,8 +244,15 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         seed=args.seed,
     )
     print(f"      Samples shape: {samples_U.shape}")
-    mkt_col = samples_U[:, crisis_spec.market_idx]
-    print(f"      Market col: max={mkt_col.max():.5f}, all ≤ alpha: {(mkt_col <= args.alpha).all()}")
+    crisis_col = samples_U[:, crisis_spec.crisis_idx]
+    if crisis_spec.tail == "lower":
+        constraint_ok = (crisis_col <= crisis_spec.threshold).all()
+        print(f"      Crisis col: max={crisis_col.max():.5f}, all ≤ {crisis_spec.threshold}: {constraint_ok}")
+        crisis_label_short = f"{market.name} ≤ VaR_{args.alpha:.0%}"
+    else:
+        constraint_ok = (crisis_col >= crisis_spec.threshold).all()
+        print(f"      Crisis col: min={crisis_col.min():.5f}, all ≥ {crisis_spec.threshold}: {constraint_ok}")
+        crisis_label_short = f"{market.name} Δyield ≥ Q_{1-args.alpha:.0%}"
 
     # Step 5: Estimate MES
     print("[5/5] Estimating MES with 95% CI (batch means)...")
@@ -214,7 +263,7 @@ def run_pipeline(args: argparse.Namespace) -> pd.DataFrame:
         alpha=args.alpha,
         batch_size=max(50, args.N_samples // 20),
     )
-    print(f"\nMES Results  (crisis = {market.name} ≤ VaR_{args.alpha:.0%}):")
+    print(f"\nMES Results  (crisis = {crisis_label_short}):")
     print(mes_df.to_string(index=False))
     return mes_df
 
@@ -229,6 +278,7 @@ def plot_mes(
     market_name: str,
     alpha: float,
     sampler: str,
+    crisis: str,
     out_path: str,
 ) -> None:
     """
@@ -241,6 +291,7 @@ def plot_mes(
     market_name : str — name of market index used for crisis definition
     alpha       : float
     sampler     : str
+    crisis      : str — 'market' or 'rates'
     out_path    : str
     """
     sectors  = mes_df["sector"].tolist()
@@ -261,13 +312,16 @@ def plot_mes(
     )
 
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    tail = "upper" if crisis == "rates" else "lower"
+    crisis_label = (f"{market_name} daily Δyield ≥ Q_{alpha:.0%}"
+                    if tail == "upper" else f"{market_name} ≤ VaR_{alpha:.0%}")
     ax.set_title(
         f"Marginal Expected Shortfall — {N_sectors} Sectors\n"
-        f"Crisis: {market_name} ≤ VaR_{alpha:.0%}   |   Sampler: {sampler.upper()}",
+        f"Crisis: {crisis_label}   |   Sampler: {sampler.upper()}",
         fontsize=13, fontweight="bold",
     )
     ax.set_xlabel(f"Sector  (N={N_sectors})", fontsize=11)
-    ax.set_ylabel(f"MES  |  E[R_sector | R_{market_name} ≤ VaR_{alpha:.0%}]", fontsize=10)
+    ax.set_ylabel(f"MES  |  E[R_sector | {crisis_label}]", fontsize=10)
     ax.tick_params(axis="x", rotation=30)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
 
@@ -299,6 +353,7 @@ def main(argv: list[str] | None = None) -> None:
         market_name=args.market,
         alpha=args.alpha,
         sampler=args.sampler,
+        crisis=args.crisis,
         out_path=args.out,
     )
 

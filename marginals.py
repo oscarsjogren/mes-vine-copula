@@ -1,14 +1,24 @@
 """
 marginals.py
 ============
-Fit GARCH(1,1) with skewed-t innovations to each of N return series
-and to a separate market index series.
+Two approaches for mapping return series to uniform pseudo-observations (PIT):
+
+  empirical  (recommended default)
+      u_jt = rank(r_jt) / (T+1)
+      Nonparametric, no model risk.  Fraction of u_j ≤ alpha is exactly
+      floor(alpha*T)/T ≈ alpha by construction, giving correct crisis calibration.
+
+  garch (parametric)
+      GARCH(1,1) with Hansen skewed-t innovations.  Accounts for conditional
+      heteroscedasticity; slower and adds model risk from the parametric tail.
 
 Exposes
 -------
-fit_marginals(returns)                      → list of N dicts  (marginals)
+empirical_pit(returns)                      → np.ndarray (T, N)  uniform pseudo-obs
+empirical_pit_market(market)                → np.ndarray (T,)    uniform pseudo-obs
+fit_marginals(returns)                      → list of N dicts  (GARCH params)
 pit_transform(returns, params_list)         → np.ndarray (T, N)  uniform pseudo-obs
-fit_market(market)                          → dict               (market marginal)
+fit_market(market)                          → dict               (GARCH market params)
 pit_transform_market(market, params)        → np.ndarray (T,)    uniform pseudo-obs
 inverse_cdf(u, params)                      → np.ndarray (S,)    back-transform
 
@@ -24,6 +34,58 @@ from arch import arch_model
 from scipy.stats import t as student_t
 from scipy.optimize import brentq, minimize
 from scipy.special import gammaln
+
+
+# ---------------------------------------------------------------------------
+# Empirical PIT (rank-based, nonparametric)
+# ---------------------------------------------------------------------------
+
+def empirical_pit(returns: pd.DataFrame) -> np.ndarray:
+    """
+    Map each return series to uniform pseudo-observations via empirical ranks.
+
+    u_jt = rank(r_jt) / (T+1)   (1-based ranks, Hazen plotting position)
+
+    The fraction of observations with u_j ≤ alpha is floor(alpha*T)/T ≈ alpha
+    by construction, fixing the calibration gap that arises with parametric
+    GARCH marginals.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame, shape (T, N)
+
+    Returns
+    -------
+    U : np.ndarray, shape (T, N) — pseudo-observations strictly in (0, 1)
+    """
+    if not isinstance(returns, pd.DataFrame):
+        raise TypeError("returns must be a pandas DataFrame.")
+    T, N = returns.shape
+    U = np.empty((T, N), dtype=float)
+    for j, col in enumerate(returns.columns):
+        vals = returns[col].values
+        ranks = np.argsort(np.argsort(vals)) + 1   # 1-based
+        U[:, j] = ranks / (T + 1)
+    return U
+
+
+def empirical_pit_market(market: pd.Series) -> np.ndarray:
+    """
+    Map the market return series to uniform pseudo-observations via empirical ranks.
+
+    Parameters
+    ----------
+    market : pd.Series, shape (T,)
+
+    Returns
+    -------
+    u_market : np.ndarray, shape (T,) — pseudo-observations strictly in (0, 1)
+    """
+    if not isinstance(market, pd.Series):
+        raise TypeError("market must be a pandas Series.")
+    T = len(market)
+    ranks = np.argsort(np.argsort(market.values)) + 1
+    return ranks / (T + 1)
 
 
 # ---------------------------------------------------------------------------

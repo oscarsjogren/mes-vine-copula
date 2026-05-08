@@ -74,15 +74,19 @@ def fit_vine(U: np.ndarray) -> VineFitResult:
 
     U = np.clip(U, 1e-6, 1 - 1e-6)
 
+    # Gaussian, Student-t, and Clayton.
+    # Clayton has lower-tail dependence (λ_l = 2^{-1/θ} > 0), which captures crash
+    # clustering (both sector and market in the lower tail together) — the exact
+    # dependence structure the crisis conditioning exploits.  pyvinecopulib selects
+    # standard Clayton (positive τ) for positively-correlated pairs; it does not
+    # expose 90°/270° rotation enums separately, so negative-τ selections are not
+    # a risk here.  Joe/BB families are still excluded: their rotation variants with
+    # negative τ were previously selected by AIC and produced counter-intuitive
+    # conditionals (a sector at its maximum during a market crash).
     family_set = [
         pv.BicopFamily.gaussian,
         pv.BicopFamily.student,
         pv.BicopFamily.clayton,
-        pv.BicopFamily.gumbel,
-        pv.BicopFamily.frank,
-        pv.BicopFamily.joe,
-        pv.BicopFamily.bb1,
-        pv.BicopFamily.bb7,
     ]
 
     controls = pv.FitControlsVinecop(

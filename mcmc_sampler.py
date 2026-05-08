@@ -1,27 +1,27 @@
 """
 mcmc_sampler.py
 ===============
-Two fully self-contained MCMC samplers drawing from the vine copula density
-conditioned on the market-index crisis event: u_market ≤ alpha.
+Two samplers drawing from the vine copula density conditioned on the
+market-index crisis event: u_market ≤ alpha.
 
-Because the crisis boundary is the flat hyperplane u[market_idx] = alpha,
-both samplers become significantly cleaner than the general case:
+  rejection (default, recommended):
+      Simulates directly from the fitted vine with pyvinecopulib's fast C++
+      backend and discards rows where u[crisis_idx] is outside the crisis
+      region.  Exact, no convergence issues, no grid resolution artifacts.
+      Expected acceptance rate ≈ alpha, so ~100x oversampling for alpha=0.01.
 
-  HMC  : When a leapfrog step would push u[market_idx] above alpha, the
-          momentum in the market dimension is simply negated (exact specular
-          reflection off a flat boundary).  All other dimensions move freely
-          subject to the Metropolis criterion.
-
-  Gibbs: When updating dimension j ≠ market_idx, the market coordinate does
-          not change, so the crisis constraint is trivially satisfied and the
-          draw is always accepted.  When updating the market dimension itself,
-          the grid is restricted to (0, alpha) so every draw stays in crisis.
+  mwg (Metropolis-within-Gibbs):
+      Cycles through each variable with a scalar Metropolis-Hastings step.
+      Crisis variable: uniform proposal over the crisis region (symmetric,
+      exact for any alpha).  Sector variables: reflected Gaussian random walk
+      with step sizes adapted during warmup to ~44% acceptance.
+      Slower than rejection but useful for MCMC convergence diagnostics.
 
 Public API
 ----------
   run_sampler(vine_result, crisis_spec, sampler, N_samples, **kwargs)
       → np.ndarray, shape (N_samples, N)
-        All rows satisfy u[:, market_idx] ≤ alpha.
+        All rows satisfy the crisis constraint.
 """
 
 from __future__ import annotations
@@ -58,40 +58,6 @@ def _vine_log_pdf(vine_result: VineFitResult, u: np.ndarray) -> float:
         return -np.inf
 
 
-def _vine_log_pdf_gradient(vine_result: VineFitResult, u: np.ndarray, eps: float = 1e-4) -> np.ndarray:
-    """
-    Numerical gradient of the vine log-density via central differences.
-
-    Parameters
-    ----------
-    vine_result : VineFitResult
-    u           : np.ndarray, shape (N,)
-    eps         : float — finite difference step
-
-    Returns
-    -------
-    grad : np.ndarray, shape (N,)
-    """
-    N = vine_result.N
-    u = np.asarray(u, dtype=float).ravel()
-    grad = np.zeros(N, dtype=float)
-
-    if not np.isfinite(_vine_log_pdf(vine_result, u)):
-        return grad
-
-    for j in range(N):
-        u_fwd = u.copy()
-        u_bwd = u.copy()
-        u_fwd[j] = min(u[j] + eps, 1 - 1e-6)
-        u_bwd[j] = max(u[j] - eps, 1e-6)
-        step = u_fwd[j] - u_bwd[j]
-        ld_fwd = _vine_log_pdf(vine_result, u_fwd)
-        ld_bwd = _vine_log_pdf(vine_result, u_bwd)
-        if np.isfinite(ld_fwd) and np.isfinite(ld_bwd):
-            grad[j] = (ld_fwd - ld_bwd) / (step + 1e-14)
-
-    return np.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
-
 
 def _find_crisis_start(crisis_spec: CrisisSpec, rng: np.random.Generator) -> np.ndarray:
     """
@@ -111,234 +77,197 @@ def _find_crisis_start(crisis_spec: CrisisSpec, rng: np.random.Generator) -> np.
     """
     N = crisis_spec.N
     u0 = rng.uniform(1e-4, 1 - 1e-4, size=N)
-    u0[crisis_spec.market_idx] = rng.uniform(1e-4, crisis_spec.alpha - 1e-6)
+    idx = crisis_spec.crisis_idx
+    if crisis_spec.tail == "lower":
+        u0[idx] = rng.uniform(1e-4, crisis_spec.alpha - 1e-6)
+    else:
+        u0[idx] = rng.uniform(crisis_spec.threshold + 1e-6, 1 - 1e-4)
     return u0
 
 
-def _gibbs_conditional_draw(
-    vine_result: VineFitResult,
-    u_current: np.ndarray,
-    j: int,
-    rng: np.random.Generator,
-    grid_size: int,
-    u_lo: float,
-    u_hi: float,
-) -> float:
-    """
-    Draw a new value for u_j from the conditional distribution p(u_j | u_{-j})
-    evaluated on a 1-D grid over (u_lo, u_hi).
-
-    The grid range allows the market dimension to be restricted to (0, alpha)
-    while other dimensions use (0, 1).
-
-    Parameters
-    ----------
-    vine_result : VineFitResult
-    u_current   : np.ndarray, shape (N,)
-    j           : int  — dimension to update (0-based)
-    rng         : np.random.Generator
-    grid_size   : int  — number of grid points
-    u_lo        : float — lower bound of grid
-    u_hi        : float — upper bound of grid
-
-    Returns
-    -------
-    u_j_new : float in (u_lo, u_hi)
-    """
-    grid = np.linspace(u_lo + 1e-6, u_hi - 1e-6, grid_size)
-    log_weights = np.empty(grid_size, dtype=float)
-
-    for k, uj_val in enumerate(grid):
-        u_probe = u_current.copy()
-        u_probe[j] = uj_val
-        log_weights[k] = _vine_log_pdf(vine_result, u_probe)
-
-    log_weights -= np.nanmax(log_weights)
-    weights = np.exp(np.where(np.isfinite(log_weights), log_weights, -np.inf))
-    w_sum = weights.sum()
-    if w_sum <= 0 or not np.isfinite(w_sum):
-        return float(u_current[j])
-
-    weights /= w_sum
-    k_drawn = rng.choice(grid_size, p=weights)
-    return float(grid[k_drawn])
+def _reflect_into_unit_interval(x: float) -> float:
+    """Fold x back into (0, 1) by reflection at 0 and 1."""
+    x = abs(x)
+    while x > 1.0:
+        x = abs(2.0 - x)
+    return float(np.clip(x, 1e-6, 1 - 1e-6))
 
 
 # ---------------------------------------------------------------------------
-# HMC sampler
+# Rejection sampler (recommended)
 # ---------------------------------------------------------------------------
 
-def _hmc_sample(
+def _rejection_sample(
     vine_result: VineFitResult,
     crisis_spec: CrisisSpec,
     N_samples: int,
-    n_leapfrog: int,
-    step_size: float,
-    n_warmup: int,
     seed: int,
+    max_batches: int = 500,
 ) -> np.ndarray:
     """
-    HMC sampler with exact specular reflection at the flat crisis boundary.
+    Sample from the vine conditioned on the crisis region via rejection sampling.
 
-    The crisis boundary u[market_idx] = alpha is a flat hyperplane, so
-    reflection reduces to negating the market momentum component whenever a
-    leapfrog step would push u[market_idx] above alpha.
+    Uses pyvinecopulib's C++ vine.simulate() for fast batch generation, then
+    discards rows outside the crisis region.  Exact and statistically correct;
+    no convergence issues, no grid resolution artifacts.
 
-    Parameters
-    ----------
-    vine_result : VineFitResult
-    crisis_spec : CrisisSpec
-    N_samples   : int  — post-warmup samples
-    n_leapfrog  : int  — leapfrog steps per proposal
-    step_size   : float — initial step size (adapted during warmup)
-    n_warmup    : int  — warmup iterations discarded
-    seed        : int
-
-    Returns
-    -------
-    samples : np.ndarray, shape (N_samples, N)
-    """
-    rng = np.random.default_rng(seed)
-    N = crisis_spec.N
-    mkt = crisis_spec.market_idx
-    alpha = crisis_spec.alpha
-
-    def potential(u: np.ndarray) -> float:
-        ld = _vine_log_pdf(vine_result, u)
-        return -ld if np.isfinite(ld) else np.inf
-
-    def grad_potential(u: np.ndarray) -> np.ndarray:
-        return -_vine_log_pdf_gradient(vine_result, u)
-
-    current_u = _find_crisis_start(crisis_spec, rng)
-
-    samples: list[np.ndarray] = []
-    adapt_step = float(step_size)
-    total_iter = n_warmup + N_samples
-
-    for iteration in range(total_iter):
-        p = rng.standard_normal(N)
-
-        proposed_u = current_u.copy()
-        proposed_p = p.copy()
-
-        proposed_p -= 0.5 * adapt_step * grad_potential(proposed_u)
-
-        for _ in range(n_leapfrog):
-            u_next = proposed_u + adapt_step * proposed_p
-
-            # Reflect off the flat boundary u[mkt] = alpha
-            if u_next[mkt] > alpha:
-                proposed_p[mkt] = -proposed_p[mkt]
-                u_next = proposed_u + adapt_step * proposed_p
-
-            # Reflect off the unit cube walls
-            for j in range(N):
-                if u_next[j] <= 0:
-                    proposed_p[j] = abs(proposed_p[j])
-                    u_next[j] = max(u_next[j], 1e-6)
-                elif u_next[j] >= 1:
-                    proposed_p[j] = -abs(proposed_p[j])
-                    u_next[j] = min(u_next[j], 1 - 1e-6)
-
-            proposed_u = u_next
-            proposed_p -= adapt_step * grad_potential(proposed_u)
-
-        proposed_p -= 0.5 * adapt_step * grad_potential(proposed_u)
-
-        # Safety: enforce crisis constraint after leapfrog
-        proposed_u[mkt] = min(proposed_u[mkt], alpha - 1e-8)
-        proposed_u = np.clip(proposed_u, 1e-6, 1 - 1e-6)
-
-        H_curr = potential(current_u) + 0.5 * float(np.dot(p, p))
-        H_prop = potential(proposed_u) + 0.5 * float(np.dot(proposed_p, proposed_p))
-
-        log_accept = -(H_prop - H_curr)
-        accept_prob = min(1.0, np.exp(log_accept)) if np.isfinite(log_accept) else 0.0
-
-        if np.log(rng.uniform()) < log_accept:
-            current_u = proposed_u.copy()
-
-        if iteration >= n_warmup:
-            samples.append(current_u.copy())
-
-        if iteration < n_warmup:
-            adapt_step *= np.exp(0.05 * (accept_prob - 0.65))
-            adapt_step = float(np.clip(adapt_step, 1e-4, 0.5))
-
-    samples_arr = np.array(samples[:N_samples])
-    if samples_arr.shape[0] < N_samples:
-        pad = np.tile(current_u, (N_samples - samples_arr.shape[0], 1))
-        samples_arr = np.vstack([samples_arr, pad])
-
-    return samples_arr
-
-
-# ---------------------------------------------------------------------------
-# Gibbs sampler
-# ---------------------------------------------------------------------------
-
-def _gibbs_sample(
-    vine_result: VineFitResult,
-    crisis_spec: CrisisSpec,
-    N_samples: int,
-    n_warmup: int,
-    seed: int,
-    grid_size: int,
-) -> np.ndarray:
-    """
-    Gibbs sampler exploiting the box-constraint structure.
-
-    For dimensions j ≠ market_idx: draw from the conditional p(u_j | u_{-j})
-    over the full (0, 1) interval — no crisis rejection needed because the
-    market coordinate stays fixed.
-
-    For j == market_idx: draw from the conditional restricted to (0, alpha),
-    so every draw automatically satisfies the crisis constraint.
+    Expected acceptance rate ≈ alpha (e.g. 5% for alpha=0.05), so each batch
+    of size ≈ N_samples/alpha rows is drawn until N_samples accepted.
 
     Parameters
     ----------
     vine_result : VineFitResult
     crisis_spec : CrisisSpec
     N_samples   : int
-    n_warmup    : int
     seed        : int
-    grid_size   : int — grid points for 1-D conditional (default 80)
+    max_batches : int — safety cap on simulation rounds
 
     Returns
     -------
     samples : np.ndarray, shape (N_samples, N)
+        All rows satisfy the crisis constraint.
+    """
+    rng = np.random.default_rng(seed)
+    idx = crisis_spec.crisis_idx
+    tail = crisis_spec.tail
+    threshold = crisis_spec.threshold
+    alpha = crisis_spec.alpha
+
+    batch_size = max(int(N_samples / alpha * 4), 10_000)
+
+    collected: list[np.ndarray] = []
+    total_accepted = 0
+
+    for _ in range(max_batches):
+        vine_seed = [int(rng.integers(0, 2**31))]
+        u_batch = vine_result.vine.simulate(batch_size, seeds=vine_seed)
+
+        if tail == "lower":
+            mask = u_batch[:, idx] <= threshold
+        else:
+            mask = u_batch[:, idx] >= threshold
+
+        accepted = u_batch[mask]
+        if len(accepted) > 0:
+            collected.append(accepted)
+            total_accepted += len(accepted)
+
+        if total_accepted >= N_samples:
+            break
+
+    if total_accepted == 0:
+        raise RuntimeError(
+            f"Rejection sampling: 0 accepted in {max_batches} batches. "
+            f"alpha={alpha}, tail='{tail}', threshold={threshold:.4f}."
+        )
+
+    all_samples = np.vstack(collected)
+
+    if total_accepted < N_samples:
+        idx_rs = rng.integers(0, total_accepted, size=N_samples)
+        return all_samples[idx_rs]
+
+    return all_samples[:N_samples]
+
+
+# ---------------------------------------------------------------------------
+# Metropolis-within-Gibbs sampler
+# ---------------------------------------------------------------------------
+
+def _mwg_sample(
+    vine_result: VineFitResult,
+    crisis_spec: CrisisSpec,
+    N_samples: int,
+    n_warmup: int,
+    seed: int,
+    sigma_init: float = 0.15,
+) -> np.ndarray:
+    """
+    Metropolis-within-Gibbs: cycle through each variable with a scalar MH step.
+
+    Crisis variable (u_market):
+        Propose uniformly from the crisis region (0, threshold) or (threshold, 1).
+        The proposal is symmetric so the MH ratio is just the vine pdf ratio.
+        This correctly samples from the vine conditional restricted to the crisis
+        region — no grid resolution issues, exact for any alpha.
+
+    Sector variables (j ≠ crisis_idx):
+        Propose u_j' = reflect(u_j + N(0, sigma_j^2)) into (0, 1).
+        Reflection at 0 and 1 keeps the proposal symmetric so the MH ratio is
+        again the pure pdf ratio.  sigma_j is adapted during warmup to keep
+        per-variable acceptance rates near 0.44 (optimal for 1-D MH).
+
+    Parameters
+    ----------
+    vine_result : VineFitResult
+    crisis_spec : CrisisSpec
+    N_samples   : int  — post-warmup samples to collect
+    n_warmup    : int  — adaptation / burn-in iterations (discarded)
+    seed        : int
+    sigma_init  : float — initial random-walk step size for sector variables
+
+    Returns
+    -------
+    samples : np.ndarray, shape (N_samples, N)
+        All rows satisfy the crisis constraint.
     """
     rng = np.random.default_rng(seed)
     N = crisis_spec.N
-    mkt = crisis_spec.market_idx
-    alpha = crisis_spec.alpha
+    idx = crisis_spec.crisis_idx
+    tail = crisis_spec.tail
+    threshold = crisis_spec.threshold
+    target_rate = 0.44
 
     current_u = _find_crisis_start(crisis_spec, rng)
+    current_ld = _vine_log_pdf(vine_result, current_u)
+
+    # Per-variable step sizes (crisis variable doesn't use sigma)
+    sigmas = np.full(N, sigma_init, dtype=float)
+
+    # Running accept counts for adaptation (reset every adapt_interval)
+    adapt_interval = 50
+    accept_counts = np.zeros(N, dtype=float)
 
     samples: list[np.ndarray] = []
     total_iter = n_warmup + N_samples
 
     for iteration in range(total_iter):
         for j in range(N):
-            # Market dimension: restrict grid to (0, alpha)
-            u_lo = 1e-6
-            u_hi = alpha - 1e-6 if j == mkt else 1 - 1e-6
+            u_prop = current_u.copy()
 
-            u_j_new = _gibbs_conditional_draw(
-                vine_result, current_u, j, rng, grid_size, u_lo, u_hi
-            )
-            current_u[j] = float(np.clip(u_j_new, u_lo, u_hi))
+            if j == idx:
+                # Uniform proposal inside the crisis region — symmetric, exact
+                if tail == "lower":
+                    u_prop[j] = rng.uniform(1e-6, threshold - 1e-6)
+                else:
+                    u_prop[j] = rng.uniform(threshold + 1e-6, 1 - 1e-6)
+            else:
+                # Reflected Gaussian random walk — symmetric proposal
+                u_prop[j] = _reflect_into_unit_interval(
+                    current_u[j] + rng.normal(0.0, sigmas[j])
+                )
+
+            prop_ld = _vine_log_pdf(vine_result, u_prop)
+            log_a = prop_ld - current_ld
+
+            if np.log(rng.uniform()) < log_a:
+                current_u = u_prop
+                current_ld = prop_ld
+                accept_counts[j] += 1
+
+        # Dual-averaging step-size adaptation during warmup
+        if iteration < n_warmup and (iteration + 1) % adapt_interval == 0:
+            rates = accept_counts / adapt_interval
+            for j in range(N):
+                if j != idx:
+                    sigmas[j] *= np.exp(rates[j] - target_rate)
+                    sigmas[j] = float(np.clip(sigmas[j], 1e-4, 1.0))
+            accept_counts[:] = 0.0
 
         if iteration >= n_warmup:
             samples.append(current_u.copy())
 
-    samples_arr = np.array(samples[:N_samples])
-    if samples_arr.shape[0] < N_samples:
-        pad = np.tile(current_u, (N_samples - samples_arr.shape[0], 1))
-        samples_arr = np.vstack([samples_arr, pad])
-
-    return samples_arr
+    return np.array(samples[:N_samples])
 
 
 # ---------------------------------------------------------------------------
@@ -348,66 +277,52 @@ def _gibbs_sample(
 def run_sampler(
     vine_result: VineFitResult,
     crisis_spec: CrisisSpec,
-    sampler: str = "gibbs",
+    sampler: str = "rejection",
     N_samples: int = 2000,
     n_warmup: int = 500,
     seed: int = 42,
-    # HMC-specific
-    n_leapfrog: int = 10,
-    step_size: float = 0.05,
-    # Gibbs-specific
-    grid_size: int = 80,
 ) -> np.ndarray:
     """
     Draw samples from the joint vine density conditioned on the crisis event.
-
-    The crisis event is u[market_idx] ≤ alpha, so all returned samples have
-    their market coordinate below alpha.
 
     Parameters
     ----------
     vine_result : VineFitResult — fitted vine on (N_sectors + 1) variables
     crisis_spec : CrisisSpec   — built from build_crisis_spec
-    sampler     : str          — 'hmc' or 'gibbs' (default 'gibbs')
+    sampler     : str          — 'rejection' (default) or 'mwg'
     N_samples   : int          — post-warmup samples (default 2000)
-    n_warmup    : int          — warmup iterations discarded (default 500)
+    n_warmup    : int          — MWG warmup iterations (default 500)
     seed        : int          — random seed (default 42)
-    n_leapfrog  : int          — HMC leapfrog steps (default 10)
-    step_size   : float        — HMC initial step size (default 0.05)
-    grid_size   : int          — Gibbs grid points per dimension (default 80)
 
     Returns
     -------
     samples : np.ndarray, shape (N_samples, N)
-        N = N_sectors + 1.  Column market_idx satisfies ≤ alpha.
+        All rows satisfy the crisis constraint on crisis_spec.crisis_idx.
     """
     sampler_lower = sampler.strip().lower()
-    if sampler_lower not in ("hmc", "gibbs"):
-        raise ValueError(f"sampler must be 'hmc' or 'gibbs', got '{sampler}'.")
+    if sampler_lower not in ("rejection", "mwg", "gibbs", "hmc"):
+        raise ValueError(f"sampler must be 'rejection' or 'mwg', got '{sampler}'.")
 
     if vine_result.N != crisis_spec.N:
         raise ValueError(
             f"vine_result.N={vine_result.N} != crisis_spec.N={crisis_spec.N}."
         )
 
-    if sampler_lower == "hmc":
-        return _hmc_sample(
+    if sampler_lower == "rejection":
+        return _rejection_sample(
             vine_result=vine_result,
             crisis_spec=crisis_spec,
             N_samples=N_samples,
-            n_leapfrog=n_leapfrog,
-            step_size=step_size,
-            n_warmup=n_warmup,
             seed=seed,
         )
     else:
-        return _gibbs_sample(
+        # 'mwg', 'gibbs', 'hmc' all route to MWG (gibbs/hmc kept as aliases)
+        return _mwg_sample(
             vine_result=vine_result,
             crisis_spec=crisis_spec,
             N_samples=N_samples,
             n_warmup=n_warmup,
             seed=seed,
-            grid_size=grid_size,
         )
 
 
@@ -419,10 +334,10 @@ if __name__ == "__main__":
     import sys
 
     N_sectors = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    sampler_test = sys.argv[2] if len(sys.argv) > 2 else "gibbs"
+    sampler_test = sys.argv[2] if len(sys.argv) > 2 else "mwg"
     N_total = N_sectors + 1
     T_test = 300
-    N_samp = 100
+    N_samp = 200
     alpha = 0.05
     rng_main = np.random.default_rng(99)
     U_test = rng_main.uniform(0.01, 0.99, size=(T_test, N_total))
@@ -433,7 +348,7 @@ if __name__ == "__main__":
     from crisis_event import build_crisis_spec
 
     vine_res = fit_vine(U_test)
-    spec = build_crisis_spec(U_test, alpha=alpha, market_name="OMXS30")
+    spec = build_crisis_spec(U_test, alpha=alpha, crisis_name="OMXS30")
     print(f"  {vine_res}")
     print(f"  {spec}")
 
@@ -441,11 +356,11 @@ if __name__ == "__main__":
         vine_res, spec,
         sampler=sampler_test,
         N_samples=N_samp,
-        n_warmup=50,
+        n_warmup=100,
         seed=7,
-        grid_size=40,
     )
     print(f"  Samples shape: {samples.shape}")
-    mkt_col = samples[:, spec.market_idx]
+    mkt_col = samples[:, spec.crisis_idx]
     print(f"  Market col max: {mkt_col.max():.4f}  (must be ≤ alpha={alpha})")
     print(f"  All in crisis: {(mkt_col <= alpha).all()}")
+    print(f"  Sector col means: {samples[:, :N_sectors].mean(axis=0).round(3)}")

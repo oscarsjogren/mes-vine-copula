@@ -238,6 +238,74 @@ def download_sector_data(
 # ---------------------------------------------------------------------------
 # Standalone test / CLI
 # ---------------------------------------------------------------------------
+# Interest rate data
+# ---------------------------------------------------------------------------
+
+def download_rate_data(
+    ticker: str = "^TNX",
+    start: str = "2010-01-01",
+    end: str | None = None,
+    force_download: bool = False,
+) -> pd.Series:
+    """
+    Download a yield series and return daily changes in basis points.
+
+    The crisis event for interest rate spikes is defined on Δyield_t
+    (the daily change), not the level, because the PIT must be applied
+    to a stationary series.  A basis-point change series is approximately
+    stationary even when the yield level is not.
+
+    Parameters
+    ----------
+    ticker         : str  — Yahoo Finance yield ticker (default '^TNX', US 10Y)
+    start          : str  — start date 'YYYY-MM-DD'
+    end            : str  — end date (default: today)
+    force_download : bool — ignore cache
+
+    Returns
+    -------
+    rate_changes : pd.Series, shape (T,)
+        Daily yield changes in basis points (×100 from the % level series).
+        Name is the ticker string.
+    """
+    if end is None:
+        end = datetime.today().strftime("%Y-%m-%d")
+
+    safe_name = ticker.replace("^", "").replace("/", "_")
+    cache_file = DATA_DIR / f"rate_{safe_name}_changes.csv"
+
+    if not force_download and cache_file.exists():
+        print(f"Loading cached rate data from {cache_file.name}")
+        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        s = df.iloc[:, 0]
+        s.name = ticker
+        return s
+
+    print(f"Downloading rate series {ticker} ({start} → {end})...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+
+    if len(hist) == 0:
+        raise RuntimeError(f"No data returned for rate ticker '{ticker}'.")
+
+    levels = hist["Close"].copy()
+    levels.index = pd.to_datetime(levels.index).tz_localize(None)
+    levels.index.name = "date"
+
+    # Daily change in basis points (yield is quoted in %, so ×100 → bps)
+    changes = levels.diff().dropna() * 100.0
+    changes.name = ticker
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({ticker: changes}).to_csv(cache_file)
+    print(f"  {len(changes)} observations, cached to {cache_file.name}")
+    print(f"  Mean change: {changes.mean():.2f} bps, Std: {changes.std():.2f} bps")
+
+    return changes
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
